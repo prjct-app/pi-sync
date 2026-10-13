@@ -8,7 +8,9 @@ import { syncHome } from "./home.ts";
 import { jsonText } from "./sync.ts";
 
 export type Auth = { token: string; connectedAt: string };
-export type StoredState = SyncState & { installed: string[] };
+/** A snapshot of the last sync run, kept so the panel can show what changed without re-running. */
+export type LastReport = { readonly files: ReadonlyArray<import("./engine.ts").FileReport>; readonly pendingPackages: readonly string[]; readonly failedPackages: readonly string[] };
+export type StoredState = SyncState & { installed: string[]; lastReport?: LastReport };
 
 export const storeDir = (_agentDir: string) => syncHome();
 

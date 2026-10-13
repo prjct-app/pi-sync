@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.0
+
+- `/sync` opens the shared docked panel: connection status, the last sync's file changes, pending and failed packages, and the one action to take. Press `l` to login, `s` to sync (preview only), `y` to sync and install new packages, `x` to logout. Login still uses the link+code flow, surfaced through a notice. Replaces the old `/pi-sync` text-only command.
+- The last sync's report is kept in `state.json` so the panel can show it without re-running.
+- State is one immutable value; every panel redraw replaces it.
+- Added `@prjct.app/pi-tui-kit` as a runtime dep.
+
 ## 0.1.0
 
 - Bidirectional sync of Pi's portable config through the pi-sync service: `settings.json`, `AGENTS.md`, `mcp.json`, `models.json`, and live `extensions/*.ts`.
