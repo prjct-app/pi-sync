@@ -1,6 +1,6 @@
 {
   "name": "@prjct.app/pi-sync",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Export and import the portable Pi configuration (settings, AGENTS.md, extensions, MCP and model config) between machines. Never exports auth or sessions.",
   "type": "module",
   "keywords": [
@@ -13,12 +13,14 @@
   "pi": {
     "extensions": [
       "./index.ts"
-    ]
+    ],
+    "image": "https://raw.githubusercontent.com/prjct-app/pi-sync/main/docs/cover.png"
   },
   "scripts": {
     "test": "export PI_CODING_AGENT_DIR=\"$(mktemp -d)\" PRJCT_HOME=\"$(mktemp -d)\" && node --import tsx --test tests/*.test.ts",
     "check": "tsc --noEmit && npm run check:immutable",
-    "check:immutable": "! grep -rn '\\blet\\b' src/ index.ts || (echo 'Use const and immutable values: no let bindings in src/ or index.ts' && exit 1)"
+    "check:immutable": "! grep -rn '\\blet\\b' src/ index.ts || (echo 'Use const and immutable values: no let bindings in src/ or index.ts' && exit 1)",
+    "check:package": "npm pack --dry-run --ignore-scripts"
   },
   "engines": {
     "node": ">=22.19.0"
@@ -38,7 +40,8 @@
     "LICENSE",
     "README.md",
     "index.ts",
-    "src"
+    "src",
+    "docs/cover.png"
   ],
   "exports": {
     ".": "./index.ts"

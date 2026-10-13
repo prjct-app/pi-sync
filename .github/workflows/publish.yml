@@ -1,0 +1,41 @@
+name: Publish package
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: publish-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - name: Verify release tag
+        run: node --input-type=module -e 'import fs from "node:fs"; const p = JSON.parse(fs.readFileSync("package.json")); if (process.env.GITHUB_REF !== `refs/tags/v${p.version}`) throw new Error("Publish from the matching version tag");'
+      - name: Check an existing release
+        id: registry
+        run: node .github/scripts/published.mjs
+      - if: steps.registry.outputs.published != 'true'
+        run: npm ci --ignore-scripts
+      - if: steps.registry.outputs.published != 'true'
+        run: npm run check
+      - if: steps.registry.outputs.published != 'true'
+        run: npm test --if-present
+      - if: steps.registry.outputs.published != 'true'
+        run: npm run check:package
+      - if: steps.registry.outputs.published != 'true'
+        run: npm publish --provenance --access public

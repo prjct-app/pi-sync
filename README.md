@@ -1,5 +1,7 @@
 # pi-sync
 
+[![pi-sync — for PI Agent](https://raw.githubusercontent.com/prjct-app/pi-sync/main/docs/cover.png)](https://pi.dev)
+
 Keeps Pi's portable configuration the same on every machine you use: settings, `AGENTS.md`, MCP and model config, and the extensions that are on. It also installs the packages listed in `settings.json`.
 
 ## Commands

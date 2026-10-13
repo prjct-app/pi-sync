@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.1
+
+- Add the English package cover to the README, npm archive, and Pi gallery metadata.
+- Publish matching version tags through the package GitHub Actions workflow.
+
+
 ## 0.2.0
 
 - `/sync` opens the shared docked panel: connection status, the last sync's file changes, pending and failed packages, and the one action to take. Press `l` to login, `s` to sync (preview only), `y` to sync and install new packages, `x` to logout. Login still uses the link+code flow, surfaced through a notice. Replaces the old `/pi-sync` text-only command.
