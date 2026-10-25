@@ -1,7 +1,7 @@
 {
   "name": "@prjct.app/pi-sync",
-  "version": "0.2.1",
-  "description": "Export and import the portable Pi configuration (settings, AGENTS.md, extensions, MCP and model config) between machines. Never exports auth or sessions.",
+  "version": "0.3.0",
+  "description": "Back up and restore complete portable Pi setups between machines, including automatic extension and package installation. Never uploads auth or sessions.",
   "type": "module",
   "keywords": [
     "pi-package",
@@ -41,7 +41,8 @@
     "README.md",
     "index.ts",
     "src",
-    "docs/cover.png"
+    "docs/cover.png",
+    "docs/deployment.md"
   ],
   "exports": {
     ".": "./index.ts"

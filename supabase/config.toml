@@ -1,0 +1,5 @@
+project_id = "pi-sync"
+
+[functions.pi-sync]
+# The function verifies opaque, product-scoped device tokens itself.
+verify_jwt = false

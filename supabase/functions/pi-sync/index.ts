@@ -4,6 +4,10 @@
 // Tokens are "pis_" + 64 hex and labelled "pi-sync" in sync_tokens, so palette tokens
 // ("pit_") are rejected here and pi-sync tokens are rejected by palette's endpoints.
 
+declare const Deno: { env: { get(key: string): string | undefined }; serve(handler: (request: Request) => Response | Promise<Response>): void };
+import { MAX_ARCHIVE_BYTES, archiveBytes, archiveSettings, isBackupId, packageSources, verifyArchive } from '../../../src/archive-schema.ts';
+import { scanForSecrets } from '../../../src/secrets.ts';
+
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const APPROVE_URL = Deno.env.get("PI_SYNC_APPROVE_URL") ?? "https://palette.prjct.app/link";
@@ -127,7 +131,7 @@ async function readState(userId: string) {
 
 async function readManifest(userId: string) {
   const files = await rest(
-    `pi_sync_files?select=path,revision,sha256,deleted,updated_at&user_id=eq.${userId}&order=path.asc`,
+    `pi_sync_files?select=path,revision,sha256,deleted,device,updated_at&user_id=eq.${userId}&order=path.asc`,
   );
   return json({ files });
 }
@@ -138,6 +142,58 @@ async function readOneFile(userId: string, path: string | null) {
     `pi_sync_files?select=path,revision,sha256,deleted,content,device,updated_at&user_id=eq.${userId}&path=eq.${encodeURIComponent(path)}`,
   );
   return rows?.[0] ? json(rows[0]) : fail(404, "not found");
+}
+
+const BACKUP_SELECT = 'id,deviceId:device_id,deviceName:device_name,createdAt:created_at,fileCount:file_count,packageCount:package_count,totalBytes:total_bytes';
+
+async function listBackups(userId: string) {
+  const backups = await rest(`pi_sync_backups?select=${BACKUP_SELECT}&user_id=eq.${userId}&order=created_at.desc&limit=100`);
+  return json({ backups });
+}
+
+async function oneBackup(userId: string, id: string, remove: boolean) {
+  if (!isBackupId(id)) return fail(400, 'invalid backup id');
+  const rows = await rest(`pi_sync_backups?select=${remove ? 'id' : `${BACKUP_SELECT},archive`}&user_id=eq.${userId}&id=eq.${id}`, remove ? { method: 'DELETE', prefer: 'return=representation' } : {});
+  if (!rows?.length) return fail(404, 'backup not found');
+  return json(remove ? { ok: true } : rows[0]);
+}
+
+async function boundedJson(req: Request): Promise<unknown> {
+  const reader = req.body?.getReader();
+  if (!reader) throw new Error('backup body required');
+  const size = { bytes: 0 };
+  const parts: string[] = [];
+  const decoder = new TextDecoder();
+  for (;;) {
+    const chunk = await reader.read();
+    if (chunk.done) break;
+    size.bytes += chunk.value.byteLength;
+    if (size.bytes > MAX_ARCHIVE_BYTES + 4096) { await reader.cancel(); throw new Error('backup exceeds 20 MiB'); }
+    parts.push(decoder.decode(chunk.value, { stream: true }));
+  }
+  parts.push(decoder.decode());
+  return JSON.parse(parts.join(''));
+}
+
+async function createBackup(userId: string, req: Request) {
+  const prepared = await (async () => {
+    const body = await boundedJson(req) as { device?: { id?: unknown; name?: unknown }; archive?: unknown };
+    if (!body || typeof body.device?.id !== 'string' || !isBackupId(body.device.id) || typeof body.device.name !== 'string' || !body.device.name.trim() || body.device.name.length > 80 || /[\x00-\x1f\x7f]/.test(body.device.name)) throw new Error('valid device id and name required');
+    const archive = await verifyArchive(body.archive);
+    if (archive.kind !== 'machine') throw new Error('a complete machine backup is required');
+    const lengths: number[] = [];
+    for (const file of archive.files) {
+      const bytes = archiveBytes(file);
+      scanForSecrets(file.path, new TextDecoder().decode(bytes));
+      lengths.push(bytes.byteLength);
+    }
+    return { user_id: userId, device_id: body.device.id, device_name: body.device.name.trim(), archive,
+      file_count: archive.files.length, package_count: packageSources(archiveSettings(archive)).length, total_bytes: lengths.reduce((sum, count) => sum + count, 0) };
+  })().catch(error => error instanceof Error ? error : new Error('invalid machine backup'));
+  if (prepared instanceof Error) return fail(prepared.message.includes('exceeds') ? 413 : 400, prepared.message.startsWith('Unexpected') ? 'invalid backup JSON' : prepared.message);
+  // One insert publishes the entire snapshot. There is never a partially uploaded machine.
+  const rows = await rest(`pi_sync_backups?select=${BACKUP_SELECT}`, { method: 'POST', prefer: 'return=representation', body: prepared });
+  return json(rows[0], 201);
 }
 
 async function writeFile(userId: string, body: Record<string, unknown>) {
@@ -181,6 +237,9 @@ Deno.serve(async (req) => {
     const userId = await authUser(req);
     if (!userId) return fail(401, "not connected");
 
+    if (req.method === 'GET' && route === '/backups') return await listBackups(userId);
+    if (req.method === 'POST' && route === '/backups') return await createBackup(userId, req);
+    if (route.startsWith('/backups/') && (req.method === 'GET' || req.method === 'DELETE')) return await oneBackup(userId, route.slice('/backups/'.length), req.method === 'DELETE');
     if (req.method === "GET" && route === "/state") return await readState(userId);
     if (req.method === "GET" && route === "/manifest") return await readManifest(userId);
     if (req.method === "GET" && route === "/file") return await readOneFile(userId, url.searchParams.get("path"));

@@ -222,6 +222,20 @@ test("an extension deleted on one machine is deleted on the other, with a backup
   await assert.rejects(readFile(join(b.agentDir, "extensions", "tool.ts")));
 });
 
+test("settings are made portable before upload and remain unchanged on the next sync", async () => {
+  const { homedir } = await import("node:os");
+  const service = fakeService({ now: 1_000 });
+  const a = await machine("portable");
+  await setFile(a.agentDir, "settings.json", JSON.stringify({
+    extensions: [join(homedir(), ".pi/agent/extensions/live.ts"), "-/private/extensions/off.ts"],
+  }) + "\n", 1_000);
+
+  await syncWithRetry(a.agentDir, a.state, service.client, "a");
+  assert.deepEqual(JSON.parse(service.files.get("settings.json")!.content).extensions, ["~/.pi/agent/extensions/live.ts"]);
+  const again = await syncWithRetry(a.agentDir, a.state, service.client, "a");
+  assert.ok(again.files.every(file => file.action === "unchanged"));
+});
+
 test("Pi's own config files never follow a deletion", async () => {
   const clock = { now: 1_000 };
   const service = fakeService(clock);

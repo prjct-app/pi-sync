@@ -6,6 +6,7 @@ import { assertSafeRelativePath, disabledExtensionFiles, fromPortableSettings, i
 test("stripSecretKeys removes credential keys, keeps token limits", () => {
   const out = stripSecretKeys({ a: { auth: "x", bearerTokenEnv: "T", maxTokens: 3, author: "me" } });
   assert.deepEqual(out, { a: { bearerTokenEnv: "T", maxTokens: 3, author: "me" } });
+  assert.deepEqual(stripSecretKeys({ headers: { Authorization: "private", Cookie: "private", Accept: "application/json" } }), { headers: { Accept: "application/json" } });
 });
 
 test("scanForSecrets refuses a secret pattern and a literal credential value", () => {

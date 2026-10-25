@@ -3,7 +3,7 @@
 
 // Key names that carry credentials, matched on the key with separators removed.
 // "maxTokens" and "bearerTokenEnv" do not match: they are limits and env var names.
-const SECRET_KEY_END = /(auth|secret|password|passwd|bearer|apikey|token)$/;
+const SECRET_KEY_END = /(authorization|cookie|privatekey|accesskey|auth|secret|password|passwd|bearer|apikey|token)$/;
 
 export const SECRET_PATTERNS: ReadonlyArray<readonly [string, RegExp]> = [
   ["openai-style key", /sk-[A-Za-z0-9_-]{16,}/],

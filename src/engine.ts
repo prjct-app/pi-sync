@@ -2,7 +2,7 @@
 // agreed with the service, so a three-way decision can tell which side changed.
 import { createHash } from "node:crypto";
 import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
-import { join, dirname } from "node:path";
+import { join, dirname, basename } from "node:path";
 import { syncHome } from "./home.ts";
 import { decideFile, mergeSettings, type FileDecision, type Side } from "./merge.ts";
 import type { SyncClient } from "./client.ts";
@@ -43,7 +43,7 @@ async function readSide(path: string): Promise<Side | undefined> {
   if (raw === undefined) return undefined;
   const content = path.endsWith("mcp.json")
     ? jsonText(stripSecretKeys(JSON.parse(raw)))
-    : path === "settings.json" ? toPortableSettings(raw) : raw;
+    : basename(path) === "settings.json" ? toPortableSettings(raw) : raw;
   return { content, updatedAt: (await stat(path)).mtimeMs };
 }
 
@@ -162,7 +162,7 @@ export async function syncOnce(
     // Code from another machine is held until you accept it: Pi loads extensions at startup.
     const writesCode = path.endsWith(".ts") && (decision.action === "take-remote" || decision.action === "merged");
     if (writesCode && !acceptCode) {
-      report.files.push({ path, action: "held: new code from another machine, run /pi-sync sync --accept-code" });
+      report.files.push({ path, action: "held: new code from another machine, press y or run /sync sync --accept-code" });
       continue;
     }
     if (decision.action === "take-remote") {

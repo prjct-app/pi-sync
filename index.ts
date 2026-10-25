@@ -1,152 +1,118 @@
-import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext } from '@earendil-works/pi-coding-agent';
 import { brand, openPanel, panelText } from '@prjct.app/pi-tui-kit';
-import { join } from "node:path";
-import { readFile } from "node:fs/promises";
-import { createClient, SERVICE_URL } from "./src/client.ts";
-import { syncWithRetry, type FileReport } from "./src/engine.ts";
-import { forgetAuth, readAuth, readState, writeAuth, writeState } from "./src/store.ts";
-import { isPinnedNpm, packagesFromSettings, DEFAULT_AGENT_DIR } from "./src/sync.ts";
-import { piHost } from "./src/pi.ts";
-import { syncPanelSpec, type SyncIntent, type SyncSnapshot, type SyncState } from "./src/panel.ts";
+import { hostname } from 'node:os';
+import { createClient, SERVICE_URL, type SyncClient } from './src/client.ts';
+import { ensureDevice, forgetAuth, readAuth, writeAuth, writeState } from './src/store.ts';
+import { DEFAULT_AGENT_DIR } from './src/sync.ts';
+import { piHost } from './src/pi.ts';
+import { runSyncPanel, syncPanelSpec, type SyncIntent, type SyncResult } from './src/panel.ts';
+import { loadSnapshot } from './src/snapshot.ts';
+import { collectMachineArchive } from './src/archive.ts';
+import { archiveSettings, isBackupId, packageSources } from './src/archive-schema.ts';
+import { fetchMachineBackup } from './src/machine-backups.ts';
+import { restoreMachineArchive } from './src/restore.ts';
 
 const AGENT_DIR = process.env.PI_CODING_AGENT_DIR || DEFAULT_AGENT_DIR;
 const LOGIN_WINDOW_MS = 5 * 60 * 1000;
-const POLL_MS = 3_000;
-const USAGE = "Usage: /sync (open the panel) · /sync report (text)";
-const deviceName = (): string => (process.env.HOSTNAME ?? "pi").slice(0, 60);
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-
-type Ui = { ui: { notify(message: string, level: "info" | "error"): void } };
+const USAGE = 'Usage: /sync (machine backups) · /sync backup · /sync restore <backup-id> · /sync report · /sync login · /sync logout';
+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 export default function piSync(pi: ExtensionAPI) {
-  pi.registerCommand("sync", {
-    description: brand("sync: keep Pi config in step across machines through the pi-sync service"),
-    handler: async (args, ctx) => {
-      const verb = args.trim().split(/\s+/)[0] ?? "";
-      if (verb === "report") return report(ctx);
-      if (verb === "help" || verb === "--help" || verb === "-h") return ctx.ui.notify(USAGE, "info");
-      return openSyncPanel(ctx);
-    },
-  });
-}
-
-async function openSyncPanel(ctx: ExtensionCommandContext): Promise<void> {
-  if (!(ctx.hasUI && ctx.mode === "tui")) {
-    await report(ctx);
-    return;
-  }
-  const initial = await loadSnapshot();
-  const pending: { intent?: SyncIntent } = {};
-  const ops = {
-    reload: async () => loadSnapshot(),
-    request: (intent: SyncIntent) => { pending.intent = intent; },
+  const handler = async (args: string, ctx: ExtensionCommandContext): Promise<void> => {
+    const result = await dispatch(args, ctx).catch(error => ({ text: `Backup: ${error instanceof Error ? error.message : String(error)}`, tone: 'error' as const }));
+    if (!result) return;
+    ctx.ui.notify(result.text, result.tone === 'error' ? 'error' : 'info');
+    // Reload replaces the runtime. Never reopen a panel or reuse this context afterwards.
+    if ('reload' in result && result.reload) return ctx.reload();
   };
-  await openPanel(ctx, syncPanelSpec(ops, { snap: initial, busy: false, notice: undefined }));
-  if (!pending.intent) return;
-  const result = await fulfil(ctx, pending.intent).catch(error => ({
-    text: `sync: ${(error as Error).message}`,
-    tone: "error" as const,
-  }));
-  const refreshed = await loadSnapshot();
-  await openPanel(ctx, syncPanelSpec(ops, { snap: refreshed, busy: false, notice: result }));
+  for (const name of ['sync', 'pi-sync']) pi.registerCommand(name, { description: brand('sync: back up this Pi setup or restore another machine, including extensions'), handler });
 }
 
-async function loadSnapshot(): Promise<SyncSnapshot> {
+async function dispatch(args: string, ctx: ExtensionCommandContext): Promise<SyncResult | undefined> {
+  const [verb, ...rest] = args.trim().split(/\s+/);
+  if (!verb && ctx.hasUI && ctx.mode === 'tui') return runSyncPanel({
+    reload: () => loadSnapshot(AGENT_DIR, hostname()), fulfil: intent => fulfil(ctx, intent),
+  }, spec => openPanel(ctx, spec));
+  if (!verb || verb === 'report' && !rest.length) {
+    const snap = await loadSnapshot(AGENT_DIR, hostname());
+    const spec = syncPanelSpec({ reload: async () => snap, request: () => undefined }, { snap, busy: false, notice: undefined });
+    return { text: `${panelText(spec)}${snap.backups.length ? `\n\nBackup IDs:\n${snap.backups.map(backup => `${backup.id}  ${backup.deviceName}`).join('\n')}` : ''}`, tone: snap.remoteError ? 'warning' : 'accent' };
+  }
+  if (['help', '--help', '-h'].includes(verb)) return { text: USAGE, tone: 'accent' };
+  if (['login', 'logout', 'backup', 'upload'].includes(verb) && !rest.length) return fulfil(ctx, { action: verb === 'upload' ? 'backup' : verb as 'login' | 'logout' | 'backup' });
+  if (['restore', 'download', 'delete'].includes(verb) && (rest.length === 1 || rest.length === 2 && rest[1] === '--yes')) {
+    const id = rest[0]!;
+    if (id !== 'legacy' && !isBackupId(id)) return { text: 'Choose a backup in /sync, or copy its ID from /sync report.', tone: 'warning' };
+    return fulfil(ctx, { action: verb === 'delete' ? 'delete' : 'restore', id }, rest[1] === '--yes');
+  }
+  return { text: `${verb === 'sync' ? 'Two-way file sync has been replaced by explicit machine backups and restores.\n' : ''}${USAGE}`, tone: 'warning' };
+}
+
+async function authenticated(): Promise<SyncClient> {
   const auth = await readAuth(AGENT_DIR);
-  const state = await readState(AGENT_DIR);
-  return {
-    connected: !!auth,
-    connectedAt: auth?.connectedAt,
-    deviceName: deviceName(),
-    serviceUrl: SERVICE_URL,
-    recentFiles: state.lastReport?.files ?? [],
-    pendingPackages: state.lastReport?.pendingPackages ?? [],
-    failedPackages: state.lastReport?.failedPackages ?? [],
-  };
+  if (!auth) throw new Error('Log in first: open /sync and press Enter.');
+  return createClient(auth.token, SERVICE_URL);
 }
 
-async function fulfil(ctx: ExtensionCommandContext, intent: SyncIntent): Promise<{ text: string; tone: "accent" | "warning" | "error" }> {
-  switch (intent.action) {
-    case "login": return await login(ctx);
-    case "sync": return await sync(ctx, intent.acceptCode);
-    case "logout": return await logout();
+async function fulfil(ctx: ExtensionCommandContext, intent: SyncIntent, approved = false): Promise<SyncResult> {
+  if (intent.action === 'login') return login(ctx);
+  if (intent.action === 'logout') {
+    const auth = await readAuth(AGENT_DIR);
+    await forgetAuth(AGENT_DIR);
+    const revoked = !auth || await createClient(auth.token, SERVICE_URL).revoke().then(() => true).catch(() => false);
+    return { text: `Logged out. Your local setup and account backups were not deleted.${revoked ? '' : '\nService unreachable: the token was removed locally but may still be active on the service.'}`, tone: revoked ? 'accent' : 'warning' };
   }
+  const client = await authenticated();
+  if (intent.action === 'delete') {
+    if (intent.id === 'legacy') throw new Error('Earlier file backups are kept separately and are not deleted here.');
+    if (!approved && (!ctx.hasUI || !await ctx.ui.confirm('Delete this backup?', 'Only this saved snapshot will be deleted. No machine configuration will change.'))) return { text: 'Deletion cancelled.', tone: 'warning' };
+    await client.deleteBackup(intent.id);
+    return { text: 'Backup deleted. Other backups and machines were not changed.', tone: 'accent' };
+  }
+  if (intent.action === 'backup') {
+    ctx.ui.notify('Preparing a complete backup of this Pi setup…', 'info');
+    const device = await ensureDevice();
+    const archive = await collectMachineArchive(AGENT_DIR, piHost(ctx.cwd, AGENT_DIR));
+    ctx.ui.setStatus('pi-sync', 'Uploading machine backup…');
+    try {
+      const saved = await client.createBackup(device, archive);
+      return { text: `Backed up ${device.name}: ${saved.fileCount} files and ${saved.packageCount} packages.\nOn another machine, log in to /sync and choose this backup.\nOlder backups were kept.`, tone: 'accent' };
+    } finally { ctx.ui.setStatus('pi-sync', undefined); }
+  }
+  const backup = await fetchMachineBackup(client, intent.id);
+  const packages = packageSources(archiveSettings(backup.archive)).length;
+  if (!approved) {
+    if (!ctx.hasUI) throw new Error('Restoring replaces local configuration and installs code. Use the interactive panel, or explicitly pass --yes.');
+    const confirmed = await ctx.ui.confirm(`Restore ${backup.deviceName}?`, [
+      `${backup.archive.files.length} files and ${packages} packages will be restored on ${hostname()}.`,
+      'This replaces the backed-up configuration and automatically installs extension code and dependencies.',
+      'Your current setup is saved locally first. Your logins, environment secrets, and sessions stay here.',
+      ...(backup.legacy ? ['This older backup is partial: it may not include all local extensions or resources.'] : []),
+      'Pi reloads automatically when the restore succeeds.',
+    ].join('\n'));
+    if (!confirmed) return { text: 'Restore cancelled. No configuration was changed.', tone: 'warning' };
+  }
+  ctx.ui.notify(`Restoring ${backup.deviceName}, including its extensions and packages…`, 'info');
+  try {
+    const restored = await restoreMachineArchive(AGENT_DIR, backup.archive, dir => piHost(ctx.cwd, dir), progress => ctx.ui.setStatus('pi-sync', progress));
+    return { text: `Restored ${backup.deviceName}: ${restored.files} files and ${restored.packages} packages.\nPrevious setup: ${restored.recoveryDir}\nReloading Pi to activate the restored setup.`, tone: 'accent', reload: true };
+  } finally { ctx.ui.setStatus('pi-sync', undefined); }
 }
 
-async function login(ctx: ExtensionCommandContext): Promise<{ text: string; tone: "accent" | "warning" | "error" }> {
+async function login(ctx: ExtensionCommandContext): Promise<SyncResult> {
   const client = createClient(undefined, SERVICE_URL);
   const link = await client.startLink();
-  ctx.ui.notify(`sync: open ${link.url} and approve code ${link.code}. Waiting up to 5 minutes.`, "info");
+  ctx.ui.notify(`Open ${link.url} and approve code ${link.code}. Waiting up to 5 minutes.`, 'info');
   const deadline = Date.now() + LOGIN_WINDOW_MS;
   while (Date.now() < deadline) {
-    await sleep(POLL_MS);
+    await sleep(3_000);
     const result = await client.claimLink(link.poll);
-    if (result.status === "ok" && result.token) {
+    if (result.status === 'ok' && result.token) {
+      await writeState(AGENT_DIR, { bases: {}, installed: [] });
       await writeAuth(AGENT_DIR, { token: result.token, connectedAt: new Date().toISOString() });
-      return { text: `Connected. Press s or y to sync.`, tone: "accent" };
+      return { text: 'Connected. Back up this machine, or select a saved machine to restore here.', tone: 'accent' };
     }
-    if (result.status === "expired" || result.status === "invalid") {
-      return { text: `Login ${result.status}; press l to try again.`, tone: "warning" };
-    }
+    if (['expired', 'invalid'].includes(result.status)) return { text: `Login ${result.status}. Press Enter to try again.`, tone: 'warning' };
   }
-  return { text: `Login was not approved in 5 minutes; press l to try again.`, tone: "warning" };
-}
-
-async function sync(ctx: ExtensionCommandContext, acceptCode: boolean): Promise<{ text: string; tone: "accent" | "warning" | "error" }> {
-  const auth = await readAuth(AGENT_DIR);
-  if (!auth) return { text: `Not connected; press l to login.`, tone: "warning" };
-  const client = createClient(auth.token, SERVICE_URL);
-  const state = await readState(AGENT_DIR);
-  const pi = piHost(process.cwd(), AGENT_DIR);
-  const report = await syncWithRetry(AGENT_DIR, state, client, deviceName(), {
-    acceptCode,
-    applySettings: (settings) => pi.applySettings(AGENT_DIR, settings),
-  });
-  if (report.files.some((f) => f.path === "settings.json" && f.action !== "unchanged")) await pi.reloadSettings();
-
-  const settings = await readFile(join(AGENT_DIR, "settings.json"), "utf8").catch(() => undefined);
-  const pending: string[] = [];
-  const failed: string[] = [];
-  for (const spec of packagesFromSettings(settings)) {
-    if (state.installed.includes(spec)) continue;
-    if (!isPinnedNpm(spec)) {
-      failed.push(`${spec}: not an exact npm version; pi-sync does not install it on another machine`);
-      continue;
-    }
-    if (!acceptCode) {
-      pending.push(spec);
-      continue;
-    }
-    try {
-      await pi.installPackage(spec);
-      state.installed.push(spec);
-    } catch (err) {
-      failed.push(`${spec}: ${(err as Error).message}`);
-    }
-  }
-  await writeState(AGENT_DIR, { ...state, lastReport: { files: report.files, pendingPackages: pending, failedPackages: failed } });
-
-  const lines = report.files.filter((f) => f.action !== "unchanged").map((f) => `${f.action} ${f.path}${f.backup ? ` (backup: ${f.backup})` : ""}`);
-  const summary = lines.length ? lines.join("\n") : "already in sync";
-  const reloadHint = report.files.some((f) => f.path.endsWith(".ts") && f.action !== "unchanged" && !f.action.startsWith("held")) ? "\nrun /reload to load the synced extensions" : "";
-  const failedHint = failed.length ? `\npackages not installed:\n${failed.join("\n")}` : "";
-  const pendingHint = pending.length ? `\n${pending.length} package(s) pending: press y to install` : "";
-  return { text: `${summary}${pendingHint}${failedHint}${reloadHint}`, tone: failed.length ? "error" : "accent" };
-}
-
-async function logout(): Promise<{ text: string; tone: "accent" | "warning" | "error" }> {
-  const auth = await readAuth(AGENT_DIR);
-  await forgetAuth(AGENT_DIR);
-  if (auth) await createClient(auth.token, SERVICE_URL).revoke().catch(() => undefined);
-  return { text: `Disconnected. The token is revoked on the service when the service is reachable. Local files were not changed.`, tone: "accent" };
-}
-
-async function report(ctx: Ui): Promise<void> {
-  try {
-    const snap = await loadSnapshot();
-    const spec = syncPanelSpec({ reload: async () => snap, request: () => undefined }, { snap, busy: false, notice: undefined });
-    ctx.ui.notify(panelText(spec), "info");
-  } catch (error) {
-    ctx.ui.notify(`sync: ${(error as Error).message}`, "error");
-  }
+  return { text: 'Login was not approved in 5 minutes. Press Enter to try again.', tone: 'warning' };
 }

@@ -1,181 +1,133 @@
-/**
- * The /sync docked panel: connection status, what would change, and the one
- * action to take. The panel never edits anything itself; the command handler
- * fulfils the intent and reopens the panel.
- */
+/** One machine per backup. Back up this machine, or select another setup and restore it. */
 import { SYMBOL, type PanelAction, type PanelDetail, type PanelItem, type PanelSpec, type Tone } from '@prjct.app/pi-tui-kit';
-import type { FileReport } from './engine.ts';
+import type { BackupInfo } from './archive-schema.ts';
 
 export type SyncIntent =
   | { readonly action: 'login' }
-  | { readonly action: 'sync'; readonly acceptCode: boolean }
-  | { readonly action: 'logout' };
-
-export type SyncOps = Readonly<{
-  reload(): Promise<SyncSnapshot>;
-  request(intent: SyncIntent): void;
-}>;
-
+  | { readonly action: 'logout' }
+  | { readonly action: 'backup' }
+  | { readonly action: 'restore'; readonly id: string }
+  | { readonly action: 'delete'; readonly id: string };
 export type SyncSnapshot = Readonly<{
   connected: boolean;
-  connectedAt?: string;
+  needsLogin?: boolean;
   deviceName: string;
+  deviceId?: string;
   serviceUrl: string;
-  recentFiles: readonly FileReport[];
-  pendingPackages: readonly string[];
-  failedPackages: readonly string[];
+  serviceReady: boolean;
+  backups: readonly BackupInfo[];
+  remoteError?: string;
 }>;
+export type SyncNotice = { readonly text: string; readonly tone: Tone };
+export type SyncResult = SyncNotice & { readonly reload?: boolean };
+export type SyncState = Readonly<{ snap: SyncSnapshot; busy: boolean; notice: SyncNotice | undefined }>;
+export type SyncOps = Readonly<{ reload(): Promise<SyncSnapshot>; request(intent: SyncIntent): void }>;
 
-export type SyncState = Readonly<{
-  snap: SyncSnapshot;
-  busy: boolean;
-  notice: { readonly text: string; readonly tone: Tone } | undefined;
-}>;
+/** Reopened panels get a fresh intent; a completed restore exits before Pi replaces the runtime. */
+export async function runSyncPanel(
+  ops: Omit<SyncOps, 'request'> & { fulfil(intent: SyncIntent): Promise<SyncResult> },
+  open: (spec: PanelSpec) => Promise<void>,
+): Promise<SyncResult | undefined> {
+  const session: { notice?: SyncNotice } = {};
+  for (;;) {
+    const pending: { intent?: SyncIntent } = {};
+    const snap = await ops.reload();
+    await open(syncPanelSpec({ reload: ops.reload, request: intent => { pending.intent = intent; } }, { snap, busy: false, notice: session.notice }));
+    if (!pending.intent) return;
+    const result = await ops.fulfil(pending.intent).catch(error => ({ text: `Backup failed: ${message(error)}`, tone: 'error' as const }));
+    if ('reload' in result && result.reload) return result;
+    session.notice = result;
+  }
+}
 
-const FILE = 'file:';
-const PKG = 'pkg:';
-const FAILED = 'failed:';
-const fileId = (path: string): string => `${FILE}${path}`;
-const pkgId = (spec: string): string => `${PKG}${spec}`;
-const failedId = (spec: string): string => `${FAILED}${spec}`;
-
-/** What the panel reads, as one immutable value; every change replaces it. */
 export function syncPanelSpec(ops: SyncOps, initial: SyncState): PanelSpec {
-  const cell: { value: SyncState } = { value: initial };
+  const cell = { value: initial };
   const listeners = new Set<() => void>();
-  const publish = (next: SyncState): void => {
-    cell.value = next;
-    for (const listener of listeners) listener();
-  };
-  const reload = async (): Promise<void> => {
-    try {
-      publish({ snap: await ops.reload(), busy: false, notice: cell.value.notice });
-    } catch (error) {
-      publish({ snap: cell.value.snap, busy: false, notice: { text: `Could not read Pi: ${errorMessage(error)}`, tone: 'error' } });
-    }
-  };
-
-  const ask = (intent: SyncIntent): void => ops.request(intent);
-
+  const publish = (state: SyncState): void => { cell.value = state; for (const listener of listeners) listener(); };
+  const connected = (): boolean => cell.value.snap.connected && !cell.value.snap.needsLogin;
+  const backupFor = (item: PanelItem | undefined): BackupInfo | undefined => cell.value.snap.backups.find(backup => item?.id === `backup:${backup.id}`);
+  const request = (intent: SyncIntent, close: () => void): void => { ops.request(intent); close(); };
   const actions: PanelAction[] = [
-    {
-      key: 'l', label: 'Login', when: () => !cell.value.snap.connected, bulk: true,
-      run: (_item, panel) => { panel.close(); ask({ action: 'login' }); },
-    },
-    {
-      key: 'y', label: 'Sync (install new packages)', when: () => cell.value.snap.connected, bulk: true,
-      run: (_item, panel) => { panel.close(); ask({ action: 'sync', acceptCode: true }); },
-    },
-    {
-      key: 's', label: 'Sync (preview only)', when: () => cell.value.snap.connected, bulk: true,
-      run: (_item, panel) => { panel.close(); ask({ action: 'sync', acceptCode: false }); },
-    },
-    {
-      key: 'x', label: 'Logout', when: () => cell.value.snap.connected, bulk: true, confirm: true,
-      run: (_item, panel) => { panel.close(); ask({ action: 'logout' }); },
-    },
+    { key: 'l', label: 'Log in', when: () => !connected(), bulk: true, run: (_item, panel) => request({ action: 'login' }, panel.close) },
+    { key: 'b', label: 'Back up this machine', when: () => connected() && cell.value.snap.serviceReady && !cell.value.busy, bulk: true, run: (_item, panel) => request({ action: 'backup' }, panel.close) },
+    { key: 'r', label: 'Restore', when: item => connected() && !!backupFor(item) && !cell.value.busy, run: (item, panel) => {
+      const backup = backupFor(item);
+      if (backup) request({ action: 'restore', id: backup.id }, panel.close);
+    } },
+    { key: 'f', label: 'Refresh', when: () => connected() && !cell.value.busy, bulk: true, run: async () => {
+      publish({ ...cell.value, busy: true });
+      try { publish({ snap: await ops.reload(), busy: false, notice: undefined }); }
+      catch (error) { publish({ ...cell.value, busy: false, notice: { text: message(error), tone: 'error' } }); }
+    } },
+    { key: 'd', label: 'Delete backup', when: item => connected() && !!backupFor(item) && !backupFor(item)?.legacy && !cell.value.busy, run: (item, panel) => {
+      const backup = backupFor(item);
+      if (backup) request({ action: 'delete', id: backup.id }, panel.close);
+    } },
+    { key: 'x', label: 'Log out', when: () => cell.value.snap.connected && !cell.value.busy, bulk: true, confirm: true, run: (_item, panel) => request({ action: 'logout' }, panel.close) },
   ];
-
   return {
-    title: 'Sync',
-    summary: () => {
-      const { connected, recentFiles, pendingPackages, failedPackages, deviceName } = cell.value.snap;
-      const status = connected ? `connected as ${deviceName}` : 'not connected';
-      const parts = [status];
-      if (recentFiles.length) parts.push(`${recentFiles.length} files changed`);
-      if (pendingPackages.length) parts.push(`${pendingPackages.length} packages to install`);
-      if (failedPackages.length) parts.push(`${failedPackages.length} package errors`);
-      return parts.join(' · ');
-    },
+    title: 'Machine backups',
+    summary: () => `${cell.value.snap.deviceName} · ${connected() ? `${cell.value.snap.backups.length} backups in your account` : 'log in to see your machines'}`,
     items: () => {
+      const { snap, notice } = cell.value;
       const items: PanelItem[] = [];
-      if (cell.value.snap.connected) {
-        for (const file of cell.value.snap.recentFiles) {
-          items.push({
-            id: fileId(file.path), label: file.path, symbol: actionSymbol(file.action), tone: actionTone(file.action),
-            meta: file.action, search: `${file.path} ${file.action}`,
-          });
-        }
-        for (const spec of cell.value.snap.pendingPackages) {
-          items.push({
-            id: pkgId(spec), label: spec, symbol: SYMBOL.attention, tone: 'accent',
-            meta: 'pending', search: `pending ${spec}`,
-          });
-        }
-        for (const spec of cell.value.snap.failedPackages) {
-          items.push({
-            id: failedId(spec), label: spec, symbol: SYMBOL.error, tone: 'error',
-            meta: 'failed', search: `failed ${spec}`,
-          });
-        }
-        if (items.length === 0) items.push({ id: 'empty', label: 'In sync', symbol: SYMBOL.ok, tone: 'success', meta: 'no changes', search: 'in sync empty' });
-      } else {
-        items.push({ id: 'disconnected', label: 'Not connected', symbol: SYMBOL.idle, tone: 'dim', meta: 'press l to login', search: 'not connected' });
-      }
+      if (notice) items.push({ id: 'notice', label: notice.text.split('\n')[0]!, meta: 'last action', symbol: notice.tone === 'error' ? SYMBOL.error : SYMBOL.ok, tone: notice.tone });
+      if (!connected()) return [...items, { id: 'login', label: snap.needsLogin ? 'Log in again' : 'Log in to your backups', symbol: SYMBOL.idle, meta: 'Enter to connect' }];
+      items.push({ id: 'this-machine', label: 'Back up this machine', symbol: SYMBOL.active, tone: 'accent', meta: snap.serviceReady ? snap.deviceName : 'service update needed' });
+      if (snap.remoteError) items.push({ id: 'error', label: 'Backup service needs attention', symbol: SYMBOL.error, tone: 'error', meta: snap.remoteError });
+      for (const backup of snap.backups) items.push({
+        id: `backup:${backup.id}`, label: backup.deviceName, symbol: SYMBOL.ok, tone: backup.legacy ? 'warning' : 'success',
+        meta: `${date(backup.createdAt)} · ${backup.legacy ? 'partial' : `${backup.fileCount} files`}`,
+        search: `${backup.deviceName} ${backup.createdAt} ${backup.deviceId === snap.deviceId ? 'this machine' : 'other machine'}`,
+      });
+      if (!snap.backups.length && !snap.remoteError) items.push({ id: 'empty', label: 'No backups yet', meta: 'Back up this machine to get started', tone: 'muted' });
       return items;
     },
-    detail: item => detailFor(item, cell.value.snap),
+    detail: item => detailFor(item, cell.value),
+    activate: {
+      label: item => item?.id === 'login' ? 'Log in' : item?.id === 'this-machine' ? 'Back up this machine' : 'Restore this backup',
+      when: item => !cell.value.busy && (item?.id === 'login' || connected() && (item?.id === 'this-machine' && cell.value.snap.serviceReady || !!backupFor(item))),
+      run: (item, panel) => {
+        if (item?.id === 'login') request({ action: 'login' }, panel.close);
+        else if (item?.id === 'this-machine') request({ action: 'backup' }, panel.close);
+        else {
+          const backup = backupFor(item);
+          if (backup) request({ action: 'restore', id: backup.id }, panel.close);
+        }
+      },
+    },
     actions,
-    empty: cell.value.busy ? 'Reading Pi…' : 'Press l to login.',
-    initial: cell.value.snap.recentFiles[0] ? fileId(cell.value.snap.recentFiles[0].path) : (cell.value.snap.connected ? 'empty' : 'disconnected'),
+    initial: initial.notice ? 'notice' : connected() ? 'this-machine' : 'login',
+    empty: 'Reading your machine backups…',
     subscribe: listener => { listeners.add(listener); return () => { listeners.delete(listener); }; },
   };
 }
 
-function detailFor(item: PanelItem, snap: SyncSnapshot): PanelDetail {
-  if (item.id === 'disconnected') {
-    return {
-      title: 'Not connected',
-      subtitle: snap.serviceUrl,
-      fields: [{ label: 'device', value: snap.deviceName }, { label: 'service', value: snap.serviceUrl }],
-      sections: [{ title: 'Press l to start login', lines: [`a short code and link appear in the editor`, `approve it on ${snap.serviceUrl} within 5 minutes`] }],
-    };
-  }
-  if (item.id === 'empty') {
-    return { title: 'In sync', subtitle: 'No changes from the service', fields: [{ label: 'device', value: snap.deviceName }] };
-  }
-  if (item.id.startsWith(FILE)) {
-    const path = item.id.slice(FILE.length);
-    const file = snap.recentFiles.find(f => f.path === path);
-    if (!file) return { title: path };
-    return {
-      title: path,
-      subtitle: file.action,
-      fields: [
-        { label: 'action', value: file.action, tone: actionTone(file.action) },
-        ...(file.revision !== undefined ? [{ label: 'revision', value: String(file.revision) }] : []),
-        ...(file.backup ? [{ label: 'backup', value: file.backup }] : []),
-      ],
-    };
-  }
-  if (item.id.startsWith(PKG)) {
-    const spec = item.id.slice(PKG.length);
-    return { title: spec, subtitle: 'pending install', fields: [{ label: 'spec', value: spec }], sections: [{ title: 'Press y to install', lines: ['the package is added to this Pi'] }] };
-  }
-  if (item.id.startsWith(FAILED)) {
-    const spec = item.id.slice(FAILED.length);
-    return { title: spec, subtitle: 'install failed', fields: [{ label: 'spec', value: spec, tone: 'error' }] };
-  }
-  return { title: item.label };
+function detailFor(item: PanelItem, { snap, notice }: SyncState): PanelDetail {
+  if (item.id === 'notice') return { title: 'Last action', sections: [{ title: 'Result', lines: notice?.text.split('\n') ?? [] }] };
+  if (item.id === 'login') return { title: 'Your machines, one account', sections: [{ title: 'Get started', lines: ['Press Enter to log in. Approve the short code in your browser.', 'Then back up this Pi setup, or choose another machine’s backup to restore it here.'] }] };
+  if (item.id === 'error') return { title: 'Backup service needs attention', sections: [{ title: 'Service', lines: [snap.remoteError ?? '', 'No setup has been changed. Earlier file backups are marked partial.'] }] };
+  if (item.id === 'this-machine' || item.id === 'empty') return {
+    title: `Back up ${snap.deviceName}`, subtitle: 'Save this complete portable Pi setup to your account.',
+    sections: [
+      { title: 'One action', lines: ['Press Enter or b. A new dated backup is created; older backups are kept.', 'On another machine: log in, choose this backup, and press Enter to restore.'] },
+      { title: 'Included', lines: ['Settings, instructions, keybindings, MCP/model definitions, extensions, skills, prompts, and themes.', 'Npm/git packages are recorded at their installed versions. Local extension sources travel with the backup.'] },
+      { title: 'Kept private', lines: ['Logins, tokens, environment files, sessions, and caches are not uploaded.'] },
+    ],
+  };
+  const backup = snap.backups.find(backup => item.id === `backup:${backup.id}`);
+  if (!backup) return { title: item.label };
+  return {
+    title: backup.deviceName, subtitle: backup.legacy ? 'Earlier file backup — not a complete machine setup' : 'Restore this Pi setup on the current machine',
+    fields: [{ label: 'created', value: date(backup.createdAt) }, { label: 'files', value: String(backup.fileCount) },
+      ...(!backup.legacy ? [{ label: 'packages', value: String(backup.packageCount) }] : []), { label: 'target machine', value: snap.deviceName }],
+    sections: [
+      { title: 'Press Enter or r to restore', lines: ['Downloads and restores the whole backed-up setup, not a two-way merge.', 'Installs the required extensions, packages, and local dependencies automatically.', 'Asks once before replacing configuration. Saves your current setup locally and reloads Pi when done.'] },
+      { title: 'Your credentials stay here', lines: ['Existing logins, environment secrets, and sessions are not replaced. You may need to log in to providers on a new machine.'] },
+      ...(backup.legacy ? [{ title: 'Partial backup', lines: ['Only the files saved by the earlier sync service are available. Missing local extension sources cannot be recreated.', 'Create a new complete backup on the source machine for reliable migration.'] }] : []),
+      { title: 'Backup ID', lines: [backup.id] },
+    ],
+  };
 }
-
-const actionSymbol = (action: string): string => {
-  if (action.startsWith('pulled') || action === 'unchanged') return SYMBOL.ok;
-  if (action.startsWith('pushed')) return SYMBOL.active;
-  if (action.startsWith('merged')) return SYMBOL.active;
-  if (action.startsWith('held')) return SYMBOL.attention;
-  if (action.startsWith('conflict')) return SYMBOL.attention;
-  if (action.startsWith('error') || action.startsWith('failed')) return SYMBOL.error;
-  return SYMBOL.idle;
-};
-const actionTone = (action: string): Tone => {
-  if (action.startsWith('pulled') || action === 'unchanged') return 'success';
-  if (action.startsWith('pushed') || action.startsWith('merged')) return 'accent';
-  if (action.startsWith('held') || action.startsWith('conflict')) return 'warning';
-  if (action.startsWith('error') || action.startsWith('failed')) return 'error';
-  return 'muted';
-};
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
+const date = (value: string): string => Number.isNaN(Date.parse(value)) ? value : new Date(value).toLocaleString('en-GB', { dateStyle: 'medium', timeStyle: 'short' });
+const message = (error: unknown): string => error instanceof Error ? error.message : String(error);

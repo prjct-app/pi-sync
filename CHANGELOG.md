@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.0
+
+- Replace the file-by-file sync panel with two explicit machine-level actions: back up this Pi setup, or select a dated machine backup and restore it.
+- Add immutable, account-scoped machine snapshots, persistent device identity, backup history, deletion, an additive database migration, and authenticated backup endpoints.
+- Include complete portable resource trees, instructions, keybindings, local package sources, binary assets, executable permissions, and resource enable/disable preferences.
+- Pin npm/git packages to their installed versions/revisions. Restore installs packages and local dependencies automatically, asks once before changing configuration, and reloads Pi without a separate accept-code step.
+- Stage restores, preserve destination credentials and machine settings, keep the previous setup, roll back ordinary failures, and prevent concurrent operations or unsafe filesystem writes.
+- Keep earlier shared file backups visible as partial backups without misrepresenting them as complete machines. Their files are not deleted by the migration.
+- Preserve legacy state reports, fix portable settings normalization, broaden credential-field protection, and keep the `/pi-sync` alias.
+- Document the production backend upgrade separately from the two-action user workflow; do not imply that updating the extension deploys the service.
+
 ## 0.2.1
 
 - Add the English package cover to the README, npm archive, and Pi gallery metadata.
