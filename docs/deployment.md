@@ -46,7 +46,11 @@ Every list/read/delete includes an account filter. The previous link, token and 
 
 ## 3. Publish or activate the extension
 
-Deploying the backend does not replace an installed npm package. Publish an appropriately versioned package through the normal release process, or explicitly configure the reviewed local checkout for testing. Do not overwrite a user's package installation or change their settings implicitly.
+Deploying the backend does not replace an installed npm package. Merge the reviewed version bump to `main`: the `Publish package` workflow checks and publishes that version automatically. Tags are not required. An already-published version is skipped; manual workflow retries must also target `main`.
+
+The npm package must authorize GitHub trusted publishing for owner `prjct-app`, repository `pi-sync`, workflow `publish.yml`, without an environment name, and allow direct `npm publish`. The workflow uses OIDC and provenance, not a personal npm login or a stored npm token. GitHub repository access alone does not grant npm publishing permission.
+
+For local testing, explicitly configure the reviewed checkout. Do not overwrite a user's package installation or change their settings implicitly.
 
 The user experience is then only: `/sync` → Back up this machine; on another machine, `/sync` → select the dated backup → Restore → one confirmation. Packages install and Pi reloads automatically.
 

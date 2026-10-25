@@ -1,7 +1,7 @@
 name: Publish package
 on:
   push:
-    tags: ['v*']
+    branches: [main]
   workflow_dispatch:
 permissions:
   contents: read
@@ -24,8 +24,8 @@ jobs:
           node-version: 24
           registry-url: https://registry.npmjs.org
           package-manager-cache: false
-      - name: Verify release tag
-        run: node --input-type=module -e 'import fs from "node:fs"; const p = JSON.parse(fs.readFileSync("package.json")); if (process.env.GITHUB_REF !== `refs/tags/v${p.version}`) throw new Error("Publish from the matching version tag");'
+      - name: Verify release source
+        run: node .github/scripts/release-source.mjs
       - name: Check an existing release
         id: registry
         run: node .github/scripts/published.mjs
